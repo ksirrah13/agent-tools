@@ -4,16 +4,14 @@ Manage multiple isolated Claude Code sessions with git worktrees, tmux, and per-
 
 ## Install
 
-Requires `gh` CLI authenticated with access to `DataDog/experimental`.
-
 ```bash
-gh api repos/DataDog/experimental/contents/users/kyle.harris/csession/install.sh --jq '.content' | base64 -d | bash
+curl -fsSL https://raw.githubusercontent.com/ksirrah13/agent-tools/main/csession/install.sh | bash
 ```
 
 Or install to a custom directory:
 
 ```bash
-CSESSION_INSTALL_DIR=~/bin gh api repos/DataDog/experimental/contents/users/kyle.harris/csession/install.sh --jq '.content' | base64 -d | bash
+curl -fsSL https://raw.githubusercontent.com/ksirrah13/agent-tools/main/csession/install.sh | CSESSION_INSTALL_DIR=~/bin bash
 ```
 
 ## Quick Start

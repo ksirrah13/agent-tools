@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # csession installer
-# Usage: gh api repos/DataDog/experimental/contents/users/kyle.harris/csession/install.sh --jq '.content' | base64 -d | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/ksirrah13/agent-tools/main/csession/install.sh | bash
 
-REPO="DataDog/experimental"
-REPO_PATH="users/kyle.harris/csession"
+REPO="ksirrah13/agent-tools"
+REPO_PATH="csession"
 INSTALL_DIR="${CSESSION_INSTALL_DIR:-$HOME/.local/bin}"
 
 RED='\033[0;31m'
@@ -26,7 +26,7 @@ echo ""
 # --- Prerequisites ---
 info "Checking prerequisites..."
 missing=false
-for cmd in tmux git gh; do
+for cmd in tmux git curl; do
   if command -v "$cmd" &>/dev/null; then
     echo -e "  ${GREEN}OK${NC}  $cmd"
   else
@@ -47,15 +47,17 @@ if [[ "$missing" == true ]]; then
 fi
 echo ""
 
-# --- Download via gh CLI (handles private repo auth) ---
+# --- Download ---
 mkdir -p "$INSTALL_DIR"
+
+BASE_URL="https://raw.githubusercontent.com/$REPO/main/$REPO_PATH"
 
 download_file() {
   local file="$1"
   local dest="$2"
   info "Downloading $file..."
-  gh api "repos/$REPO/contents/$REPO_PATH/$file" --jq '.content' 2>/dev/null | base64 -d > "$dest" || {
-    error "Failed to download $file. Check your GitHub access to $REPO."
+  curl -fsSL "$BASE_URL/$file" -o "$dest" || {
+    error "Failed to download $file from $BASE_URL/$file"
     exit 1
   }
 }
