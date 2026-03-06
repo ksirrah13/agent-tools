@@ -1,0 +1,1643 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# csession - Claude Code session manager
+# Manages isolated sessions with git worktrees, tmux, and per-session state
+
+# Configuration: override via ~/.csession.conf or environment variables
+CSESSION_CONFIG="$HOME/.csession.conf"
+# shellcheck disable=SC1090
+[[ -f "$CSESSION_CONFIG" ]] && source "$CSESSION_CONFIG"
+
+SESSIONS_DIR="${CSESSION_SESSIONS_DIR:-$HOME/.claude-sessions}"
+REPOS_ROOT="${CSESSION_REPOS_ROOT:-$HOME/go/src/github.com/DataDog}"
+WORKSPACES_DIR="${CSESSION_WORKSPACES_DIR:-$HOME/workspaces}"
+BRANCH_PREFIX="${CSESSION_BRANCH_PREFIX:-$(git config user.name 2>/dev/null | tr ' ' '.' | tr '[:upper:]' '[:lower:]')}"
+# Fallback if git config is empty
+BRANCH_PREFIX="${BRANCH_PREFIX:-$(whoami)}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+usage() {
+  cat <<'EOF'
+csession - Claude Code session manager
+
+USAGE:
+  csession new <id> --repo <repo> [options]    Create a new session
+  csession attach <id>                         Attach to an existing tmux session
+  csession resume <id>                         Resume last Claude conversation in session
+  csession list                                List all sessions
+  csession status                              Show session status (running/idle)
+  csession destroy <id> [--keep-state]         Destroy a session
+  csession window <id> <name> [options]        Add a sub-thread window
+  csession run <id> --prompt <prompt>          Run Claude headless in a session
+  csession logs <id>                           Tail session logs
+  csession info <id>                           Show session details
+  csession clone <id> <new-id>                 Fork a session (copy state, new worktree)
+  csession open <id>                           Open session worktree in editor
+  csession send <id> <message>                 Send keystrokes to a running session
+  csession watch <id>                          Stream session output (read-only)
+  csession checkpoint <id>                     Save progress, restart Claude fresh
+  csession dashboard                           Live overview of all sessions
+  csession batch <manifest.yaml>               Launch multiple sessions from a manifest
+
+  csession template list                       List available templates
+  csession template show <name>                Show template contents
+  csession template create <name>              Create a new template interactively
+  csession template init                       Create default templates
+
+  csession setup                               Configure csession for first use
+
+OPTIONS (new/window):
+  --repo <repo>              Repository name (under DataDog/)
+  --read-repos <r1,r2,...>   Additional repos for read-only reference
+  --template <name>          Session template to use
+  --branch <branch>          Branch name (default: <branch-prefix>/<id>)
+  --existing-branch          Use existing branch instead of creating new one
+  --no-worktree              Don't create a worktree, use repo directly
+  --permission <mode>        Permission mode (default, acceptEdits, plan, bypassPermissions)
+  --allowed-tools <tools>    Comma-separated list of allowed tools
+  --instructions <text>      Additional instructions to add to session CLAUDE.md
+  --instructions-file <path> File containing additional instructions
+  --prompt <prompt>          Initial prompt to send to Claude
+
+EXAMPLES:
+  csession new AWSCORE-270 --repo dd-go
+  csession new AWSCORE-270 --repo dd-go --read-repos consul-config,integrations-core
+  csession new AWSCORE-270 --repo dd-go --template autonomous
+  csession new quick-fix --repo dd-go --instructions "Focus on fixing the flaky test in pkg/foo"
+  csession new safe-task --repo dd-go --allowed-tools "Read,Grep,Glob,Edit"
+  csession resume AWSCORE-270
+  csession window AWSCORE-270 research --permission plan
+  csession clone AWSCORE-270 AWSCORE-270-v2
+  csession attach AWSCORE-270
+  csession send AWSCORE-270 "/checkpoint"
+  csession watch AWSCORE-270
+  csession checkpoint AWSCORE-270
+  csession dashboard
+  csession batch sessions.yaml
+  csession run AWSCORE-270 --prompt "Implement the plan in progress.md"
+  csession list
+  csession destroy AWSCORE-270
+
+  csession template list
+  csession template show autonomous
+  csession template create my-template
+EOF
+}
+
+# --- Helpers ---
+
+session_dir() {
+  echo "$SESSIONS_DIR/$1"
+}
+
+tmux_session_name() {
+  echo "cs/$1"
+}
+
+worktree_path() {
+  echo "$WORKSPACES_DIR/$1"
+}
+
+log_file() {
+  echo "$(session_dir "$1")/claude.log"
+}
+
+info() { echo -e "${BLUE}>>>${NC} $*"; }
+success() { echo -e "${GREEN}>>>${NC} $*"; }
+warn() { echo -e "${YELLOW}>>>${NC} $*"; }
+error() { echo -e "${RED}>>>${NC} $*" >&2; }
+
+load_template() {
+  local template_file="$SESSIONS_DIR/templates/$1.conf"
+  if [[ ! -f "$template_file" ]]; then
+    error "Template '$1' not found at $template_file"
+    echo ""
+    echo "Available templates:"
+    cmd_template_list
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "$template_file"
+}
+
+ensure_session_exists() {
+  local sid="$1"
+  local sdir
+  sdir="$(session_dir "$sid")"
+  if [[ ! -d "$sdir" ]]; then
+    error "Session '$sid' does not exist. Use 'csession list' to see sessions."
+    exit 1
+  fi
+}
+
+get_work_dir() {
+  local session_id="$1"
+  # shellcheck disable=SC1090
+  source "$(session_dir "$session_id")/session.conf"
+  if [[ "$NO_WORKTREE" == "true" ]]; then
+    echo "$REPO_PATH"
+  else
+    worktree_path "$session_id"
+  fi
+}
+
+# Build the claude command from session config
+build_claude_cmd() {
+  local session_id="$1"
+  local mode="${2:-interactive}" # interactive, headless, continue
+  local prompt="${3:-}"
+
+  local sdir
+  sdir="$(session_dir "$session_id")"
+  # shellcheck disable=SC1090
+  source "$sdir/session.conf"
+
+  local cmd="claude"
+
+  # Permission mode
+  if [[ -n "${PERMISSION:-}" && "$PERMISSION" != "default" ]]; then
+    cmd+=" --permission-mode $PERMISSION"
+  fi
+
+  # Allowed tools
+  if [[ -n "${ALLOWED_TOOLS:-}" ]]; then
+    cmd+=" --allowedTools $ALLOWED_TOOLS"
+  fi
+
+  # Read-only repos as --add-dir
+  if [[ -n "${READ_REPOS:-}" ]]; then
+    IFS=',' read -ra repos <<< "$READ_REPOS"
+    for r in "${repos[@]}"; do
+      cmd+=" --add-dir $REPOS_ROOT/$r"
+    done
+  fi
+
+  case "$mode" in
+    continue)
+      cmd+=" --continue"
+      ;;
+    headless)
+      local logfile
+      logfile="$(log_file "$session_id")"
+      cmd+=" -p \"$prompt\" 2>&1 | tee -a $logfile"
+      ;;
+  esac
+
+  echo "$cmd"
+}
+
+# Relative time display
+relative_time() {
+  local timestamp="$1"
+  local now
+  now=$(date +%s)
+  local then
+  then=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$timestamp" +%s 2>/dev/null || date -d "$timestamp" +%s 2>/dev/null || echo "$now")
+  local diff=$(( now - then ))
+
+  if (( diff < 60 )); then echo "${diff}s ago"
+  elif (( diff < 3600 )); then echo "$(( diff / 60 ))m ago"
+  elif (( diff < 86400 )); then echo "$(( diff / 3600 ))h ago"
+  else echo "$(( diff / 86400 ))d ago"
+  fi
+}
+
+# --- Commands ---
+
+cmd_new() {
+  local session_id="" repo="" branch="" template="" permission="" prompt=""
+  local read_repos="" no_worktree=false existing_branch=false
+  local allowed_tools="" instructions="" instructions_file=""
+  local no_attach=false
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --read-repos) read_repos="$2"; shift 2 ;;
+      --template) template="$2"; shift 2 ;;
+      --branch) branch="$2"; shift 2 ;;
+      --existing-branch) existing_branch=true; shift ;;
+      --no-worktree) no_worktree=true; shift ;;
+      --no-attach) no_attach=true; shift ;;
+      --permission) permission="$2"; shift 2 ;;
+      --allowed-tools) allowed_tools="$2"; shift 2 ;;
+      --instructions) instructions="$2"; shift 2 ;;
+      --instructions-file) instructions_file="$2"; shift 2 ;;
+      --prompt) prompt="$2"; shift 2 ;;
+      -*) error "Unknown option: $1"; usage; exit 1 ;;
+      *) session_id="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$session_id" ]]; then
+    error "Session ID is required"
+    usage
+    exit 1
+  fi
+
+  if [[ -z "$repo" ]]; then
+    error "--repo is required"
+    exit 1
+  fi
+
+  local sdir
+  sdir="$(session_dir "$session_id")"
+  local tmux_name
+  tmux_name="$(tmux_session_name "$session_id")"
+  local wt_path
+  wt_path="$(worktree_path "$session_id")"
+
+  # Check session doesn't already exist
+  if [[ -d "$sdir" ]]; then
+    error "Session '$session_id' already exists. Use 'csession attach $session_id' or 'csession destroy $session_id' first."
+    exit 1
+  fi
+
+  # Load template if specified (sets defaults for permission, allowed_tools, etc.)
+  # Template values are overridden by explicit CLI args
+  if [[ -n "$template" ]]; then
+    load_template "$template"
+    # Template sets PERMISSION, ALLOWED_TOOLS, TEMPLATE_CLAUDE_MD as env vars
+    # CLI args override template defaults
+    [[ -z "$permission" && -n "${PERMISSION:-}" ]] && permission="$PERMISSION"
+    [[ -z "$allowed_tools" && -n "${ALLOWED_TOOLS:-}" ]] && allowed_tools="$ALLOWED_TOOLS"
+  fi
+
+  local repo_path="$REPOS_ROOT/$repo"
+  if [[ ! -d "$repo_path" ]]; then
+    error "Repo not found at $repo_path"
+    exit 1
+  fi
+
+  # Default branch name
+  if [[ -z "$branch" ]]; then
+    branch="$BRANCH_PREFIX/$session_id"
+  fi
+
+  # Create session state directory and .claude settings dir
+  mkdir -p "$sdir"
+  info "Created session state: $sdir"
+
+  # Save session metadata
+  cat > "$sdir/session.conf" <<CONF
+SESSION_ID="$session_id"
+REPO="$repo"
+REPO_PATH="$repo_path"
+BRANCH="$branch"
+TEMPLATE="${template:-none}"
+PERMISSION="${permission:-default}"
+ALLOWED_TOOLS="$allowed_tools"
+READ_REPOS="$read_repos"
+NO_WORKTREE="$no_worktree"
+CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CONF
+
+  # Set up working directory
+  local work_dir="$repo_path"
+
+  if [[ "$no_worktree" == false ]]; then
+    if [[ "$existing_branch" == true ]]; then
+      # Use existing branch for worktree
+      if ! git -C "$repo_path" rev-parse --verify "$branch" &>/dev/null; then
+        error "Branch '$branch' does not exist in $repo"
+        rm -rf "$sdir"
+        exit 1
+      fi
+      git -C "$repo_path" worktree add "$wt_path" "$branch" 2>/dev/null || {
+        error "Failed to create worktree. Branch may already be checked out."
+        rm -rf "$sdir"
+        exit 1
+      }
+    else
+      # Create new branch and worktree
+      local base_branch
+      base_branch="$(git -C "$repo_path" symbolic-ref --short HEAD 2>/dev/null || echo "main")"
+      git -C "$repo_path" worktree add -b "$branch" "$wt_path" "$base_branch" 2>/dev/null || {
+        # Branch might already exist, try without -b
+        git -C "$repo_path" worktree add "$wt_path" "$branch" 2>/dev/null || {
+          error "Failed to create worktree for branch '$branch'"
+          rm -rf "$sdir"
+          exit 1
+        }
+      }
+    fi
+    work_dir="$wt_path"
+    success "Created worktree: $wt_path (branch: $branch)"
+  fi
+
+  # Create per-session .claude directory for session-specific settings
+  local session_claude_dir="$work_dir/.claude"
+  mkdir -p "$session_claude_dir"
+
+  # Create session-specific settings.json with permissions
+  if [[ -n "$allowed_tools" || ("${permission:-default}" != "default") ]]; then
+    cat > "$session_claude_dir/settings.local.json" <<JSON
+{
+  "permissions": {
+    "allow": [$(echo "$allowed_tools" | sed 's/,/", "/g; s/^/"/; s/$/"/' 2>/dev/null || echo '')],
+    "deny": []
+  }
+}
+JSON
+  fi
+
+  # Create session CLAUDE.md
+  local session_claude_md="$work_dir/CLAUDE.md"
+  {
+    echo "# Session: $session_id"
+    echo ""
+    echo "## Session State"
+    echo "- Session directory: $sdir"
+    echo "- Progress file: $sdir/progress.md (update this before context gets large)"
+    echo "- Notes file: $sdir/notes.md (scratch notes, findings, references)"
+    echo ""
+    echo "## Session Rules"
+    echo "- Before your context gets large, save your progress to $sdir/progress.md"
+    echo "- Save important findings and research to $sdir/notes.md"
+    echo "- Commit work frequently with clear messages"
+
+    # Add read-only repos
+    if [[ -n "$read_repos" ]]; then
+      echo ""
+      echo "## Reference Repos (read-only, do NOT modify)"
+      IFS=',' read -ra repos <<< "$read_repos"
+      for r in "${repos[@]}"; do
+        echo "- $REPOS_ROOT/$r"
+      done
+    fi
+
+    # Add template-specific instructions
+    if [[ -n "${TEMPLATE_CLAUDE_MD:-}" ]]; then
+      echo ""
+      echo "$TEMPLATE_CLAUDE_MD"
+    fi
+
+    # Add custom instructions from --instructions flag
+    if [[ -n "$instructions" ]]; then
+      echo ""
+      echo "## Custom Instructions"
+      echo "$instructions"
+    fi
+
+    # Add custom instructions from --instructions-file flag
+    if [[ -n "$instructions_file" ]]; then
+      if [[ -f "$instructions_file" ]]; then
+        echo ""
+        echo "## Custom Instructions"
+        cat "$instructions_file"
+      else
+        warn "Instructions file not found: $instructions_file"
+      fi
+    fi
+  } > "$session_claude_md"
+
+  # Create initial progress and notes files
+  cat > "$sdir/progress.md" <<MD
+# Progress: $session_id
+
+## Objective
+<!-- Describe what this session is trying to accomplish -->
+
+## Status
+- [ ] Started
+
+## Plan
+<!-- Outline the steps to complete -->
+
+## Completed Steps
+<!-- Record what's been done -->
+
+## Context
+<!-- Key context for resuming: important file paths, decisions made, blockers -->
+MD
+
+  touch "$sdir/notes.md"
+
+  # Build and save the launch command
+  local claude_cmd
+  claude_cmd="$(build_claude_cmd "$session_id" interactive)"
+  echo "$claude_cmd" > "$sdir/launch_cmd.sh"
+
+  # Create tmux session
+  if tmux has-session -t "$tmux_name" 2>/dev/null; then
+    warn "tmux session '$tmux_name' already exists, attaching..."
+    tmux attach-session -t "$tmux_name"
+    return
+  fi
+
+  tmux new-session -d -s "$tmux_name" -c "$work_dir"
+  tmux set-option -t "$tmux_name" remain-on-exit off
+
+  # Send the claude command to the tmux session
+  if [[ -n "$prompt" ]]; then
+    # Headless mode
+    local headless_cmd
+    headless_cmd="$(build_claude_cmd "$session_id" headless "$prompt")"
+    tmux send-keys -t "$tmux_name" "$headless_cmd" C-m
+    success "Session '$session_id' started in headless mode"
+    info "Use 'csession logs $session_id' to watch output"
+    info "Use 'csession attach $session_id' to attach"
+  else
+    # Interactive mode - start claude
+    tmux send-keys -t "$tmux_name" "$claude_cmd" C-m
+    success "Session '$session_id' created!"
+    if [[ "$no_attach" == true ]]; then
+      info "Use 'csession attach $session_id' to connect"
+    else
+      info "Attaching to tmux session..."
+      tmux attach-session -t "$tmux_name"
+    fi
+  fi
+}
+
+cmd_attach() {
+  local session_id="$1"
+  ensure_session_exists "$session_id"
+
+  local tmux_name
+  tmux_name="$(tmux_session_name "$session_id")"
+
+  if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+    warn "tmux session not running. Restarting..."
+    local work_dir
+    work_dir="$(get_work_dir "$session_id")"
+    tmux new-session -d -s "$tmux_name" -c "$work_dir"
+    info "tmux session recreated. Start Claude manually or use 'csession resume $session_id'."
+  fi
+
+  tmux attach-session -t "$tmux_name"
+}
+
+cmd_resume() {
+  local session_id="$1"
+  ensure_session_exists "$session_id"
+
+  local tmux_name
+  tmux_name="$(tmux_session_name "$session_id")"
+  local work_dir
+  work_dir="$(get_work_dir "$session_id")"
+
+  # Ensure tmux session exists
+  if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+    tmux new-session -d -s "$tmux_name" -c "$work_dir"
+  fi
+
+  # Build continue command
+  local claude_cmd
+  claude_cmd="$(build_claude_cmd "$session_id" continue)"
+
+  tmux send-keys -t "$tmux_name" "$claude_cmd" C-m
+
+  success "Resuming last Claude conversation in session '$session_id'"
+  tmux attach-session -t "$tmux_name"
+}
+
+cmd_list() {
+  if [[ ! -d "$SESSIONS_DIR" ]] || [[ -z "$(ls -A "$SESSIONS_DIR" 2>/dev/null | grep -v templates)" ]]; then
+    info "No sessions found."
+    return
+  fi
+
+  printf "${BOLD}%-22s %-16s %-12s %-8s %-12s %-28s${NC}\n" "SESSION" "REPO" "TEMPLATE" "TMUX" "AGE" "BRANCH"
+  printf "%-22s %-16s %-12s %-8s %-12s %-28s\n" "-------" "----" "--------" "----" "---" "------"
+
+  for sdir in "$SESSIONS_DIR"/*/; do
+    [[ -f "$sdir/session.conf" ]] || continue
+    local sid
+    sid="$(basename "$sdir")"
+
+    # shellcheck disable=SC1090
+    source "$sdir/session.conf"
+
+    local tmux_name
+    tmux_name="$(tmux_session_name "$sid")"
+    local tmux_status
+    if tmux has-session -t "$tmux_name" 2>/dev/null; then
+      tmux_status="${GREEN}alive${NC}"
+    else
+      tmux_status="${RED}dead${NC}"
+    fi
+
+    local age
+    age="$(relative_time "${CREATED:-1970-01-01T00:00:00Z}")"
+
+    printf "%-22s %-16s %-12s %-18b %-12s %-28s\n" \
+      "$sid" "${REPO:-?}" "${TEMPLATE:-none}" "$tmux_status" "$age" "${BRANCH:-?}"
+  done
+}
+
+cmd_status() {
+  cmd_list
+}
+
+cmd_destroy() {
+  local session_id="$1"
+  local keep_state=false
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep-state) keep_state=true; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  ensure_session_exists "$session_id"
+
+  local sdir
+  sdir="$(session_dir "$session_id")"
+  local tmux_name
+  tmux_name="$(tmux_session_name "$session_id")"
+  local wt_path
+  wt_path="$(worktree_path "$session_id")"
+
+  # Kill tmux session
+  if tmux has-session -t "$tmux_name" 2>/dev/null; then
+    tmux kill-session -t "$tmux_name"
+    info "Killed tmux session"
+  fi
+
+  # Load config for cleanup
+  # shellcheck disable=SC1090
+  source "$sdir/session.conf"
+
+  # Remove worktree
+  if [[ -d "$wt_path" ]]; then
+    # Remove session-specific files from worktree before removing
+    rm -f "$wt_path/CLAUDE.md" 2>/dev/null || true
+    rm -rf "$wt_path/.claude/settings.local.json" 2>/dev/null || true
+    git -C "$REPO_PATH" worktree unlock "$wt_path" 2>/dev/null || true
+    if ! git -C "$REPO_PATH" worktree remove "$wt_path" --force 2>/dev/null; then
+      warn "Could not remove worktree via git, removing directory..."
+      rm -rf "$wt_path" 2>/dev/null || true
+      git -C "$REPO_PATH" worktree prune 2>/dev/null || true
+    fi
+    info "Removed worktree"
+  fi
+
+  # Remove session state
+  if [[ "$keep_state" == true ]]; then
+    warn "Keeping session state at $sdir"
+  else
+    rm -rf "$sdir"
+    info "Removed session state"
+  fi
+
+  success "Session '$session_id' destroyed"
+}
+
+cmd_window() {
+  local session_id="$1"
+  local window_name="$2"
+  shift 2 || { error "Usage: csession window <id> <name> [--permission <mode>]"; exit 1; }
+
+  ensure_session_exists "$session_id"
+
+  local permission="" allowed_tools=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --permission) permission="$2"; shift 2 ;;
+      --allowed-tools) allowed_tools="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local tmux_name
+  tmux_name="$(tmux_session_name "$session_id")"
+
+  if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+    error "tmux session not running. Use 'csession attach $session_id' first."
+    exit 1
+  fi
+
+  local work_dir
+  work_dir="$(get_work_dir "$session_id")"
+
+  # Create new tmux window
+  tmux new-window -t "$tmux_name" -n "$window_name" -c "$work_dir"
+
+  local claude_cmd="claude"
+  if [[ -n "$permission" && "$permission" != "default" ]]; then
+    claude_cmd+=" --permission-mode $permission"
+  fi
+  if [[ -n "$allowed_tools" ]]; then
+    claude_cmd+=" --allowedTools $allowed_tools"
+  fi
+
+  tmux send-keys -t "$tmux_name:$window_name" "$claude_cmd" C-m
+
+  success "Created window '$window_name' in session '$session_id'"
+  info "Attaching..."
+  tmux attach-session -t "$tmux_name:$window_name"
+}
+
+cmd_run() {
+  local session_id="$1"
+  shift
+  local prompt=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prompt) prompt="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  if [[ -z "$prompt" ]]; then
+    error "--prompt is required for headless run"
+    exit 1
+  fi
+
+  ensure_session_exists "$session_id"
+
+  local tmux_name
+  tmux_name="$(tmux_session_name "$session_id")"
+
+  if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+    local work_dir
+    work_dir="$(get_work_dir "$session_id")"
+    tmux new-session -d -s "$tmux_name" -c "$work_dir"
+  fi
+
+  local claude_cmd
+  claude_cmd="$(build_claude_cmd "$session_id" headless "$prompt")"
+
+  tmux send-keys -t "$tmux_name" "$claude_cmd" C-m
+
+  success "Headless run started in session '$session_id'"
+  info "Logs: $(log_file "$session_id")"
+  info "Attach: csession attach $session_id"
+}
+
+cmd_logs() {
+  local session_id="$1"
+  ensure_session_exists "$session_id"
+  local logfile
+  logfile="$(log_file "$session_id")"
+  if [[ ! -f "$logfile" ]]; then
+    info "No logs yet for session '$session_id'"
+    return
+  fi
+  tail -f "$logfile"
+}
+
+cmd_info() {
+  local session_id="$1"
+  ensure_session_exists "$session_id"
+
+  local sdir
+  sdir="$(session_dir "$session_id")"
+
+  echo -e "${BOLD}Session: $session_id${NC}"
+  echo ""
+
+  # shellcheck disable=SC1090
+  source "$sdir/session.conf"
+
+  echo -e "${CYAN}Repo:${NC}       $REPO"
+  echo -e "${CYAN}Branch:${NC}     $BRANCH"
+  echo -e "${CYAN}Template:${NC}   ${TEMPLATE:-none}"
+  echo -e "${CYAN}Permission:${NC} ${PERMISSION:-default}"
+  [[ -n "${ALLOWED_TOOLS:-}" ]] && echo -e "${CYAN}Tools:${NC}      $ALLOWED_TOOLS"
+  [[ -n "${READ_REPOS:-}" ]] && echo -e "${CYAN}Read repos:${NC} $READ_REPOS"
+  echo -e "${CYAN}Created:${NC}    ${CREATED:-unknown} ($(relative_time "${CREATED:-1970-01-01T00:00:00Z}"))"
+
+  local wt_path
+  wt_path="$(worktree_path "$session_id")"
+  if [[ -d "$wt_path" ]]; then
+    echo ""
+    echo -e "${CYAN}Worktree:${NC} $wt_path"
+    local changes
+    changes="$(git -C "$wt_path" status --short 2>/dev/null | wc -l | tr -d ' ')"
+    local commits
+    commits="$(git -C "$wt_path" log --oneline "${BRANCH}@{upstream}..${BRANCH}" 2>/dev/null | wc -l | tr -d ' ' || echo "?")"
+    echo -e "${CYAN}Changes:${NC}  $changes files modified, $commits unpushed commits"
+    if (( changes > 0 )); then
+      git -C "$wt_path" status --short 2>/dev/null | head -10
+      (( changes > 10 )) && echo -e "  ${DIM}... and $((changes - 10)) more${NC}"
+    fi
+  fi
+
+  echo ""
+  echo -e "${CYAN}State files:${NC}"
+  for f in "$sdir"/*.md; do
+    [[ -f "$f" ]] || continue
+    local lines
+    lines="$(wc -l < "$f" | tr -d ' ')"
+    local size
+    size="$(du -h "$f" | cut -f1 | tr -d ' ')"
+    printf "  %-20s %s lines, %s\n" "$(basename "$f")" "$lines" "$size"
+  done
+
+  local tmux_name
+  tmux_name="$(tmux_session_name "$session_id")"
+  echo ""
+  if tmux has-session -t "$tmux_name" 2>/dev/null; then
+    echo -e "${CYAN}tmux:${NC} ${GREEN}running${NC}"
+    tmux list-windows -t "$tmux_name" 2>/dev/null | sed 's/^/  /'
+  else
+    echo -e "${CYAN}tmux:${NC} ${RED}not running${NC}"
+  fi
+
+  echo ""
+  echo -e "${CYAN}Launch cmd:${NC} $(cat "$sdir/launch_cmd.sh" 2>/dev/null || echo "n/a")"
+}
+
+cmd_clone() {
+  local source_id="$1"
+  local new_id="$2"
+
+  if [[ -z "$source_id" || -z "$new_id" ]]; then
+    error "Usage: csession clone <source-id> <new-id>"
+    exit 1
+  fi
+
+  ensure_session_exists "$source_id"
+
+  local source_dir
+  source_dir="$(session_dir "$source_id")"
+  local new_dir
+  new_dir="$(session_dir "$new_id")"
+
+  if [[ -d "$new_dir" ]]; then
+    error "Session '$new_id' already exists"
+    exit 1
+  fi
+
+  # Load source config
+  # shellcheck disable=SC1090
+  source "$source_dir/session.conf"
+
+  # Copy session state
+  cp -r "$source_dir" "$new_dir"
+  info "Copied session state to $new_dir"
+
+  # Update session.conf with new ID and branch
+  local new_branch="$BRANCH_PREFIX/$new_id"
+  cat > "$new_dir/session.conf" <<CONF
+SESSION_ID="$new_id"
+REPO="$REPO"
+REPO_PATH="$REPO_PATH"
+BRANCH="$new_branch"
+TEMPLATE="${TEMPLATE:-none}"
+PERMISSION="${PERMISSION:-default}"
+ALLOWED_TOOLS="${ALLOWED_TOOLS:-}"
+READ_REPOS="${READ_REPOS:-}"
+NO_WORKTREE="$NO_WORKTREE"
+CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CLONED_FROM="$source_id"
+CONF
+
+  # Create new worktree if source had one
+  if [[ "$NO_WORKTREE" != "true" ]]; then
+    local new_wt
+    new_wt="$(worktree_path "$new_id")"
+    local source_wt
+    source_wt="$(worktree_path "$source_id")"
+
+    # Create new branch from source branch
+    git -C "$REPO_PATH" worktree add -b "$new_branch" "$new_wt" "$BRANCH" 2>/dev/null || {
+      git -C "$REPO_PATH" worktree add "$new_wt" "$new_branch" 2>/dev/null || {
+        error "Failed to create worktree for clone"
+        rm -rf "$new_dir"
+        exit 1
+      }
+    }
+
+    # Copy CLAUDE.md to new worktree (update session references)
+    if [[ -f "$source_wt/CLAUDE.md" ]]; then
+      sed "s|$source_id|$new_id|g; s|$source_dir|$new_dir|g" "$source_wt/CLAUDE.md" > "$new_wt/CLAUDE.md"
+    fi
+
+    # Copy .claude settings if they exist
+    if [[ -d "$source_wt/.claude" ]]; then
+      cp -r "$source_wt/.claude" "$new_wt/.claude"
+    fi
+
+    success "Created worktree: $new_wt (branch: $new_branch, forked from $BRANCH)"
+  fi
+
+  # Update progress.md to note the clone
+  cat >> "$new_dir/progress.md" <<MD
+
+## Cloned from: $source_id
+- Cloned on: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+- Source branch: $BRANCH
+MD
+
+  # Rebuild launch command
+  local claude_cmd
+  claude_cmd="$(build_claude_cmd "$new_id" interactive)"
+  echo "$claude_cmd" > "$new_dir/launch_cmd.sh"
+
+  success "Session '$new_id' cloned from '$source_id'"
+  info "Use 'csession attach $new_id' to start working"
+}
+
+cmd_open() {
+  local session_id="$1"
+  ensure_session_exists "$session_id"
+
+  local work_dir
+  work_dir="$(get_work_dir "$session_id")"
+
+  if command -v code &>/dev/null; then
+    code "$work_dir"
+    success "Opened $work_dir in VS Code"
+  elif command -v cursor &>/dev/null; then
+    cursor "$work_dir"
+    success "Opened $work_dir in Cursor"
+  else
+    info "Worktree path: $work_dir"
+    warn "No editor found (tried: code, cursor)"
+  fi
+}
+
+cmd_send() {
+  local session_id="$1"
+  shift
+  local message="$*"
+
+  if [[ -z "$message" ]]; then
+    error "Usage: csession send <id> <message>"
+    exit 1
+  fi
+
+  ensure_session_exists "$session_id"
+
+  local tmux_name
+  tmux_name="$(tmux_session_name "$session_id")"
+
+  if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+    error "tmux session not running. Use 'csession attach $session_id' first."
+    exit 1
+  fi
+
+  # Send the message as keystrokes followed by Enter
+  tmux send-keys -t "$tmux_name" "$message" C-m
+
+  success "Sent to '$session_id': $message"
+}
+
+cmd_watch() {
+  local session_id="$1"
+  ensure_session_exists "$session_id"
+
+  local tmux_name
+  tmux_name="$(tmux_session_name "$session_id")"
+
+  if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+    error "tmux session not running."
+    exit 1
+  fi
+
+  info "Watching session '$session_id' (read-only, Ctrl-C to stop)"
+  echo ""
+
+  # Capture tmux pane content in a loop
+  while true; do
+    clear
+    echo -e "${BOLD}=== csession watch: $session_id ===${NC} $(date '+%H:%M:%S')"
+    echo ""
+    # Capture visible pane content
+    tmux capture-pane -t "$tmux_name" -p 2>/dev/null || {
+      warn "Session ended."
+      break
+    }
+    sleep 2
+  done
+}
+
+cmd_checkpoint() {
+  local session_id="$1"
+  ensure_session_exists "$session_id"
+
+  local sdir
+  sdir="$(session_dir "$session_id")"
+  local tmux_name
+  tmux_name="$(tmux_session_name "$session_id")"
+
+  if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+    error "tmux session not running."
+    exit 1
+  fi
+
+  info "Checkpointing session '$session_id'..."
+
+  # Also save a scrollback snapshot as backup context
+  tmux capture-pane -t "$tmux_name" -p -S -500 > "$sdir/scrollback-snapshot.txt" 2>/dev/null || true
+  info "Saved scrollback snapshot to $sdir/scrollback-snapshot.txt"
+
+  # Send checkpoint request to Claude
+  local checkpoint_prompt="IMPORTANT: Your context is being checkpointed. Please save your current progress NOW:
+1. Write a detailed summary of everything you've done, your current state, and what remains to $sdir/progress.md
+2. Include: what files you changed, what approach you're taking, any blockers or decisions made
+3. Include the exact next steps someone (or you) should take to continue this work
+4. After writing progress.md, say CHECKPOINT_COMPLETE"
+
+  tmux send-keys -t "$tmux_name" "$checkpoint_prompt" C-m
+
+  # Wait loop with retry support
+  local max_wait=120
+  while true; do
+    info "Waiting for Claude to save progress (up to ${max_wait}s)..."
+
+    local waited=0
+    local found=false
+    while (( waited < max_wait )); do
+      local pane_content
+      pane_content="$(tmux capture-pane -t "$tmux_name" -p -S -50 2>/dev/null || echo "")"
+      if echo "$pane_content" | grep -q "CHECKPOINT_COMPLETE"; then
+        found=true
+        break
+      fi
+      sleep 3
+      waited=$((waited + 3))
+      if (( waited % 15 == 0 )); then
+        echo -n "."
+      fi
+    done
+    echo ""
+
+    if [[ "$found" == true ]]; then
+      success "Claude confirmed progress saved"
+      break
+    fi
+
+    # Timed out — show what Claude is doing and offer options
+    warn "Timed out waiting for CHECKPOINT_COMPLETE."
+    echo ""
+    echo -e "${BOLD}Current session output:${NC}"
+    echo -e "${DIM}─────────────────────────────────────${NC}"
+    tmux capture-pane -t "$tmux_name" -p 2>/dev/null | tail -15
+    echo -e "${DIM}─────────────────────────────────────${NC}"
+    echo ""
+    echo "Claude may still be working on a task. Options:"
+    echo "  1) Wait another 120s"
+    echo "  2) Attach to session to check manually (checkpoint aborted)"
+    echo "  3) Continue with checkpoint anyway (progress may be incomplete)"
+    read -rp "Choice [1]: " timeout_choice
+    timeout_choice="${timeout_choice:-1}"
+
+    case "$timeout_choice" in
+      1) continue ;;
+      2)
+        info "Attaching to session. Run 'csession checkpoint $session_id' again when ready."
+        tmux attach-session -t "$tmux_name"
+        return
+        ;;
+      3)
+        warn "Proceeding without confirmation. Check $sdir/progress.md manually."
+        break
+        ;;
+    esac
+  done
+
+  # Record checkpoint timestamp
+  echo "LAST_CHECKPOINT=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"" >> "$sdir/session.conf"
+
+  # Ask user what to do next
+  echo ""
+  echo -e "${BOLD}Checkpoint complete. What next?${NC}"
+  echo "  1) Restart Claude fresh (new conversation, reads progress.md)"
+  echo "  2) Keep current session running"
+  echo "  3) Stop session (can resume later)"
+  read -rp "Choice [1]: " choice
+  choice="${choice:-1}"
+
+  case "$choice" in
+    1)
+      # Send Ctrl-C then /exit to kill current Claude, wait, then restart
+      tmux send-keys -t "$tmux_name" C-c
+      sleep 1
+      tmux send-keys -t "$tmux_name" "/exit" C-m
+      sleep 2
+
+      # Start fresh Claude with instruction to read progress
+      local claude_cmd
+      claude_cmd="$(build_claude_cmd "$session_id" interactive)"
+      tmux send-keys -t "$tmux_name" "$claude_cmd" C-m
+      sleep 1
+      tmux send-keys -t "$tmux_name" "Read $sdir/progress.md and continue the work described there. Also check $sdir/notes.md for any relevant findings." C-m
+
+      success "Restarted Claude fresh with progress context"
+      info "Use 'csession attach $session_id' to reconnect"
+      ;;
+    2)
+      success "Session continues running"
+      ;;
+    3)
+      tmux send-keys -t "$tmux_name" C-c
+      sleep 1
+      tmux send-keys -t "$tmux_name" "/exit" C-m
+      success "Session stopped. Use 'csession resume $session_id' to continue later."
+      ;;
+  esac
+}
+
+cmd_dashboard() {
+  local interval=5
+
+  # Simple built-in watch loop (works on macOS without GNU watch)
+  info "Dashboard refreshing every ${interval}s (Ctrl-C to stop)"
+  echo ""
+
+  while true; do
+    clear
+    _dashboard_render
+    sleep "$interval"
+  done
+}
+
+_dashboard_render() {
+  echo -e "${BOLD}csession dashboard${NC}  $(date '+%Y-%m-%d %H:%M:%S')"
+  echo ""
+
+  if [[ ! -d "$SESSIONS_DIR" ]] || [[ -z "$(ls -A "$SESSIONS_DIR" 2>/dev/null | grep -v templates)" ]]; then
+    echo "  No sessions."
+    return
+  fi
+
+  local total=0 alive=0 dead=0
+
+  printf "${BOLD}%-20s %-14s %-10s %-8s %-10s %-8s %-20s${NC}\n" \
+    "SESSION" "REPO" "TEMPLATE" "TMUX" "AGE" "CHANGES" "BRANCH"
+  printf "%-20s %-14s %-10s %-8s %-10s %-8s %-20s\n" \
+    "-------" "----" "--------" "----" "---" "-------" "------"
+
+  for sdir in "$SESSIONS_DIR"/*/; do
+    [[ -f "$sdir/session.conf" ]] || continue
+    local sid
+    sid="$(basename "$sdir")"
+    total=$((total + 1))
+
+    # shellcheck disable=SC1090
+    source "$sdir/session.conf"
+
+    local tmux_name
+    tmux_name="$(tmux_session_name "$sid")"
+    local tmux_status
+    if tmux has-session -t "$tmux_name" 2>/dev/null; then
+      tmux_status="${GREEN}alive${NC}"
+      alive=$((alive + 1))
+    else
+      tmux_status="${RED}dead${NC}"
+      dead=$((dead + 1))
+    fi
+
+    local age
+    age="$(relative_time "${CREATED:-1970-01-01T00:00:00Z}")"
+
+    # Count changes in worktree
+    local changes="-"
+    local wt_path
+    wt_path="$(worktree_path "$sid")"
+    if [[ -d "$wt_path" ]]; then
+      changes="$(git -C "$wt_path" status --short 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+
+    printf "%-20s %-14s %-10s %-18b %-10s %-8s %-20s\n" \
+      "$sid" "${REPO:-?}" "${TEMPLATE:-none}" "$tmux_status" "$age" "$changes" "${BRANCH:-?}"
+  done
+
+  echo ""
+  echo -e "${DIM}Total: $total | Alive: $alive | Dead: $dead${NC}"
+
+  # Show last checkpoint times if any
+  local has_checkpoints=false
+  for sdir in "$SESSIONS_DIR"/*/; do
+    [[ -f "$sdir/session.conf" ]] || continue
+    if grep -q "LAST_CHECKPOINT" "$sdir/session.conf" 2>/dev/null; then
+      if [[ "$has_checkpoints" == false ]]; then
+        echo ""
+        echo -e "${BOLD}Recent Checkpoints:${NC}"
+        has_checkpoints=true
+      fi
+      local sid
+      sid="$(basename "$sdir")"
+      local cp_time
+      cp_time="$(grep "LAST_CHECKPOINT" "$sdir/session.conf" | tail -1 | cut -d'"' -f2)"
+      echo "  $sid: $(relative_time "$cp_time")"
+    fi
+  done
+}
+
+cmd_batch() {
+  local manifest="${1:-}"
+
+  if [[ -z "$manifest" || ! -f "$manifest" ]]; then
+    error "Usage: csession batch <manifest.yaml>"
+    echo ""
+    echo "Manifest format (YAML-like, one session per block):"
+    echo ""
+    cat <<'EXAMPLE'
+# sessions.yaml
+- id: AWSCORE-270
+  repo: dd-go
+  template: autonomous
+  prompt: "Implement the changes from the Jira ticket"
+
+- id: AWSCORE-271
+  repo: consul-config
+  template: research
+  read_repos: dd-go,datacenter-config
+
+- id: AWSCORE-272
+  repo: dd-go
+  branch: yourname/fix-flaky-test
+  existing_branch: true
+  instructions: "Fix the flaky test in pkg/aggregator"
+EXAMPLE
+    exit 1
+  fi
+
+  info "Reading manifest: $manifest"
+
+  # Simple YAML-like parser (handles our flat structure)
+  local current_id="" current_repo="" current_template="" current_branch=""
+  local current_prompt="" current_read_repos="" current_instructions=""
+  local current_permission="" current_allowed_tools="" current_existing_branch=""
+  local count=0
+
+  _batch_launch() {
+    if [[ -z "$current_id" || -z "$current_repo" ]]; then
+      return
+    fi
+
+    local cmd="csession new $current_id --repo $current_repo --no-attach"
+    [[ -n "$current_template" ]] && cmd+=" --template $current_template"
+    [[ -n "$current_branch" ]] && cmd+=" --branch $current_branch"
+    [[ "$current_existing_branch" == "true" ]] && cmd+=" --existing-branch"
+    [[ -n "$current_read_repos" ]] && cmd+=" --read-repos $current_read_repos"
+    [[ -n "$current_permission" ]] && cmd+=" --permission $current_permission"
+    [[ -n "$current_allowed_tools" ]] && cmd+=" --allowed-tools $current_allowed_tools"
+    [[ -n "$current_instructions" ]] && cmd+=" --instructions \"$current_instructions\""
+    [[ -n "$current_prompt" ]] && cmd+=" --prompt \"$current_prompt\""
+
+    info "Launching: $current_id (repo: $current_repo)"
+    eval "$cmd" &
+    count=$((count + 1))
+
+    # Small delay to avoid race conditions with tmux
+    sleep 2
+  }
+
+  _batch_reset() {
+    current_id="" current_repo="" current_template="" current_branch=""
+    current_prompt="" current_read_repos="" current_instructions=""
+    current_permission="" current_allowed_tools="" current_existing_branch=""
+  }
+
+  _batch_reset
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Skip comments and empty lines
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+
+    # New session block
+    if [[ "$line" =~ ^-[[:space:]] ]]; then
+      # Launch previous session if we had one
+      _batch_launch
+      _batch_reset
+      # Parse the first field on the - line
+      line="${line#- }"
+    fi
+
+    # Strip leading whitespace
+    line="${line#"${line%%[![:space:]]*}"}"
+
+    # Parse key: value
+    if [[ "$line" =~ ^([a-z_]+):[[:space:]]*(.+)$ ]]; then
+      local key="${BASH_REMATCH[1]}"
+      local val="${BASH_REMATCH[2]}"
+      # Remove surrounding quotes
+      val="${val#\"}"
+      val="${val%\"}"
+
+      case "$key" in
+        id) current_id="$val" ;;
+        repo) current_repo="$val" ;;
+        template) current_template="$val" ;;
+        branch) current_branch="$val" ;;
+        existing_branch) current_existing_branch="$val" ;;
+        prompt) current_prompt="$val" ;;
+        read_repos) current_read_repos="$val" ;;
+        instructions) current_instructions="$val" ;;
+        permission) current_permission="$val" ;;
+        allowed_tools) current_allowed_tools="$val" ;;
+      esac
+    fi
+  done < "$manifest"
+
+  # Launch the last session
+  _batch_launch
+
+  # Wait for all background launches
+  wait
+
+  echo ""
+  success "Launched $count sessions from manifest"
+  echo ""
+  cmd_list
+}
+
+# --- Template Commands ---
+
+cmd_template_list() {
+  local tdir="$SESSIONS_DIR/templates"
+  if [[ ! -d "$tdir" ]] || [[ -z "$(ls -A "$tdir" 2>/dev/null)" ]]; then
+    info "No templates found. Run 'csession template init' to create defaults."
+    return
+  fi
+
+  printf "${BOLD}%-20s %-15s %-50s${NC}\n" "TEMPLATE" "PERMISSION" "DESCRIPTION"
+  printf "%-20s %-15s %-50s\n" "--------" "----------" "-----------"
+
+  for f in "$tdir"/*.conf; do
+    [[ -f "$f" ]] || continue
+    local name
+    name="$(basename "$f" .conf)"
+    local desc
+    desc="$(head -1 "$f" | sed 's/^# //')"
+    # Extract PERMISSION value
+    local perm
+    perm="$(grep '^PERMISSION=' "$f" | head -1 | cut -d'"' -f2)"
+    printf "%-20s %-15s %-50s\n" "$name" "${perm:-default}" "$desc"
+  done
+}
+
+cmd_template_show() {
+  local name="$1"
+  local template_file="$SESSIONS_DIR/templates/$name.conf"
+  if [[ ! -f "$template_file" ]]; then
+    error "Template '$name' not found"
+    cmd_template_list
+    exit 1
+  fi
+  echo -e "${BOLD}Template: $name${NC}"
+  echo -e "${DIM}$template_file${NC}"
+  echo ""
+  cat "$template_file"
+}
+
+cmd_template_create() {
+  local name="$1"
+  local tdir="$SESSIONS_DIR/templates"
+  mkdir -p "$tdir"
+  local template_file="$tdir/$name.conf"
+
+  if [[ -f "$template_file" ]]; then
+    error "Template '$name' already exists at $template_file"
+    exit 1
+  fi
+
+  echo -e "${BOLD}Creating template: $name${NC}"
+  echo ""
+
+  # Interactive prompts
+  read -rp "Description (one line): " desc
+  echo ""
+  echo "Permission modes: default, acceptEdits, plan, bypassPermissions"
+  read -rp "Permission mode [default]: " perm
+  perm="${perm:-default}"
+  echo ""
+  read -rp "Allowed tools (comma-separated, or empty for all): " tools
+  echo ""
+  echo "Enter CLAUDE.md instructions for this template (end with empty line):"
+  local claude_md=""
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && break
+    claude_md+="$line"$'\n'
+  done
+
+  cat > "$template_file" <<CONF
+# $desc
+PERMISSION="$perm"
+ALLOWED_TOOLS="$tools"
+TEMPLATE_CLAUDE_MD="## Template: $name
+$claude_md"
+CONF
+
+  success "Created template: $template_file"
+}
+
+cmd_template_init() {
+  local tdir="$SESSIONS_DIR/templates"
+  mkdir -p "$tdir"
+
+  cat > "$tdir/autonomous.conf" <<'CONF'
+# Autonomous implementation - commits frequently, no questions asked
+PERMISSION="acceptEdits"
+ALLOWED_TOOLS=""
+TEMPLATE_CLAUDE_MD="## Autonomous Mode
+- You are running autonomously. Commit after each logical unit of work.
+- Update progress.md frequently with what you've done and what's next.
+- If you encounter a blocker, document it in notes.md and move on to the next task.
+- Do NOT ask questions — make reasonable decisions and document your assumptions."
+CONF
+
+  cat > "$tdir/research.conf" <<'CONF'
+# Research-only - read and document, no code changes
+PERMISSION="plan"
+ALLOWED_TOOLS=""
+TEMPLATE_CLAUDE_MD="## Research Mode
+- You are in research mode. Do NOT modify any source code files.
+- Write all findings to the session notes.md file.
+- Focus on understanding the codebase, documenting patterns, and answering questions.
+- Summarize your findings clearly so they can inform implementation work."
+CONF
+
+  cat > "$tdir/review.conf" <<'CONF'
+# Code review - read-only analysis and feedback
+PERMISSION="plan"
+ALLOWED_TOOLS=""
+TEMPLATE_CLAUDE_MD="## Review Mode
+- You are reviewing code. Do NOT modify files.
+- Read the changes, understand the context, and provide feedback.
+- Document any issues or suggestions in notes.md."
+CONF
+
+  cat > "$tdir/fullsend.conf" <<'CONF'
+# Full autonomy - bypasses all permissions, use with caution
+PERMISSION="bypassPermissions"
+ALLOWED_TOOLS=""
+TEMPLATE_CLAUDE_MD="## Full Autonomy Mode
+- You have full permissions. Use them responsibly.
+- Commit frequently. Update progress.md before context gets large.
+- Run tests after making changes. Fix failures before moving on."
+CONF
+
+  cat > "$tdir/safe.conf" <<'CONF'
+# Safe mode - read/write code only, no shell access
+PERMISSION="default"
+ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Agent"
+TEMPLATE_CLAUDE_MD="## Safe Mode
+- You have limited tools: read, edit, write, search only.
+- No shell access. Focus on code changes.
+- Ask the user if you need to run any commands."
+CONF
+
+  cat > "$tdir/investigate.conf" <<'CONF'
+# Investigation - read code and run safe commands
+PERMISSION="default"
+ALLOWED_TOOLS="Read,Grep,Glob,Agent,Bash(git:*),Bash(go:test*)"
+TEMPLATE_CLAUDE_MD="## Investigation Mode
+- You are investigating a problem. Read code, search patterns, run tests.
+- Document findings in notes.md with file paths and line numbers.
+- Propose fixes but do not implement them without confirmation."
+CONF
+
+  success "Created templates in $tdir:"
+  cmd_template_list
+}
+
+cmd_setup() {
+  echo -e "${BOLD}csession setup${NC}"
+  echo ""
+
+  local config_file="$HOME/.csession.conf"
+  local changed=false
+
+  # --- Check prerequisites ---
+  echo -e "${BOLD}Checking prerequisites...${NC}"
+
+  local missing=false
+  for cmd in tmux git claude; do
+    if command -v "$cmd" &>/dev/null; then
+      echo -e "  ${GREEN}OK${NC}  $cmd ($(command -v "$cmd"))"
+    else
+      echo -e "  ${RED}MISSING${NC}  $cmd"
+      missing=true
+    fi
+  done
+  echo ""
+
+  if [[ "$missing" == true ]]; then
+    error "Install missing prerequisites before continuing."
+    exit 1
+  fi
+
+  # --- Load existing config if present ---
+  local existing_repos_root="" existing_workspaces="" existing_branch_prefix="" existing_sessions=""
+  if [[ -f "$config_file" ]]; then
+    info "Found existing config: $config_file"
+    # shellcheck disable=SC1090
+    source "$config_file"
+    existing_repos_root="${CSESSION_REPOS_ROOT:-}"
+    existing_workspaces="${CSESSION_WORKSPACES_DIR:-}"
+    existing_branch_prefix="${CSESSION_BRANCH_PREFIX:-}"
+    existing_sessions="${CSESSION_SESSIONS_DIR:-}"
+    echo ""
+  fi
+
+  # --- Repos root ---
+  local default_repos_root="${existing_repos_root:-}"
+  if [[ -z "$default_repos_root" ]]; then
+    # Try to detect a sensible default
+    if [[ -d "$HOME/go/src/github.com" ]]; then
+      # Find the most populated org dir
+      local best_dir=""
+      local best_count=0
+      for d in "$HOME/go/src/github.com"/*/; do
+        [[ -d "$d" ]] || continue
+        local c
+        c="$(ls -1 "$d" 2>/dev/null | wc -l | tr -d ' ')"
+        if (( c > best_count )); then
+          best_count=$c
+          best_dir="${d%/}"
+        fi
+      done
+      default_repos_root="${best_dir:-$HOME/go/src/github.com}"
+    elif [[ -d "$HOME/src" ]]; then
+      default_repos_root="$HOME/src"
+    else
+      default_repos_root="$HOME/repos"
+    fi
+  fi
+
+  echo -e "${BOLD}Where are your git repos?${NC}"
+  echo -e "  This is the parent directory containing your repositories."
+  read -rp "  Repos root [$default_repos_root]: " input_repos_root
+  local final_repos_root="${input_repos_root:-$default_repos_root}"
+
+  if [[ ! -d "$final_repos_root" ]]; then
+    warn "Directory $final_repos_root does not exist."
+    read -rp "  Create it? [Y/n]: " create_it
+    if [[ "${create_it:-y}" =~ ^[Yy] ]]; then
+      mkdir -p "$final_repos_root"
+      success "Created $final_repos_root"
+    fi
+  fi
+  echo ""
+
+  # --- Workspaces dir ---
+  local default_workspaces="${existing_workspaces:-$HOME/workspaces}"
+
+  echo -e "${BOLD}Where should worktrees be created?${NC}"
+  echo -e "  Each session gets an isolated git worktree in this directory."
+  read -rp "  Workspaces dir [$default_workspaces]: " input_workspaces
+  local final_workspaces="${input_workspaces:-$default_workspaces}"
+
+  if [[ ! -d "$final_workspaces" ]]; then
+    mkdir -p "$final_workspaces"
+    success "Created $final_workspaces"
+  fi
+  echo ""
+
+  # --- Branch prefix ---
+  local git_name
+  git_name="$(git config user.name 2>/dev/null | tr ' ' '.' | tr '[:upper:]' '[:lower:]')"
+  local default_branch_prefix="${existing_branch_prefix:-${git_name:-$(whoami)}}"
+
+  echo -e "${BOLD}Branch name prefix?${NC}"
+  echo -e "  Branches will be named: <prefix>/<session-id>"
+  echo -e "  Example: ${CYAN}${default_branch_prefix}/AWSCORE-270${NC}"
+  read -rp "  Branch prefix [$default_branch_prefix]: " input_branch_prefix
+  local final_branch_prefix="${input_branch_prefix:-$default_branch_prefix}"
+  echo ""
+
+  # --- Sessions dir ---
+  local default_sessions="${existing_sessions:-$HOME/.claude-sessions}"
+
+  echo -e "${BOLD}Where should session state be stored?${NC}"
+  echo -e "  Progress files, notes, and config for each session."
+  read -rp "  Sessions dir [$default_sessions]: " input_sessions
+  local final_sessions="${input_sessions:-$default_sessions}"
+
+  if [[ ! -d "$final_sessions" ]]; then
+    mkdir -p "$final_sessions"
+    success "Created $final_sessions"
+  fi
+  echo ""
+
+  # --- Write config ---
+  cat > "$config_file" <<CONF
+# csession configuration
+# Generated by 'csession setup' on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Parent directory containing your git repositories
+CSESSION_REPOS_ROOT="$final_repos_root"
+
+# Directory where git worktrees are created for each session
+CSESSION_WORKSPACES_DIR="$final_workspaces"
+
+# Prefix for branch names: <prefix>/<session-id>
+CSESSION_BRANCH_PREFIX="$final_branch_prefix"
+
+# Directory for session state (progress, notes, config)
+CSESSION_SESSIONS_DIR="$final_sessions"
+CONF
+
+  success "Saved config to $config_file"
+  echo ""
+
+  # --- Templates ---
+  local tdir="$final_sessions/templates"
+  if [[ ! -d "$tdir" ]] || [[ -z "$(ls -A "$tdir" 2>/dev/null)" ]]; then
+    echo -e "${BOLD}Initialize default templates?${NC}"
+    read -rp "  Create templates? [Y/n]: " init_templates
+    if [[ "${init_templates:-y}" =~ ^[Yy] ]]; then
+      cmd_template_init
+    fi
+  else
+    info "Templates already exist in $tdir"
+  fi
+  echo ""
+
+  # --- Shell completion ---
+  local script_dir
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  local completion_file="$script_dir/_csession"
+
+  echo -e "${BOLD}Shell completion${NC}"
+  if [[ -f "$completion_file" ]]; then
+    echo -e "  ${GREEN}OK${NC}  Completion file found: $completion_file"
+  else
+    warn "Completion file not found at $completion_file"
+    echo "  Copy _csession to the same directory as csession."
+  fi
+
+  # Check fpath
+  local fpath_ok=false
+  if grep -q 'fpath=.*local/bin' "$HOME/.zshrc" 2>/dev/null || \
+     grep -q "fpath=.*$(dirname "$0")" "$HOME/.zshrc" 2>/dev/null; then
+    fpath_ok=true
+    echo -e "  ${GREEN}OK${NC}  fpath configured in .zshrc"
+  else
+    echo -e "  ${YELLOW}NOTE${NC}  Add this to your .zshrc for tab completion:"
+    echo ""
+    echo "    fpath=($script_dir \$fpath)"
+    echo ""
+  fi
+  echo ""
+
+  # --- Summary ---
+  echo -e "${BOLD}Setup complete!${NC}"
+  echo ""
+  echo "  Config:     $config_file"
+  echo "  Repos:      $final_repos_root"
+  echo "  Workspaces: $final_workspaces"
+  echo "  Sessions:   $final_sessions"
+  echo "  Branches:   $final_branch_prefix/<session-id>"
+  echo ""
+  echo "Get started:"
+  echo "  csession new my-task --repo <repo-name>"
+  echo ""
+  echo "To reconfigure, run 'csession setup' again."
+}
+
+# --- Main ---
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+command="$1"
+shift
+
+case "$command" in
+  new) cmd_new "$@" ;;
+  attach) cmd_attach "$@" ;;
+  resume) cmd_resume "$@" ;;
+  list|ls) cmd_list ;;
+  status) cmd_status ;;
+  destroy|rm) cmd_destroy "$@" ;;
+  window|win) cmd_window "$@" ;;
+  run) cmd_run "$@" ;;
+  logs) cmd_logs "$@" ;;
+  info) cmd_info "$@" ;;
+  clone) cmd_clone "$@" ;;
+  open) cmd_open "$@" ;;
+  send) cmd_send "$@" ;;
+  watch) cmd_watch "$@" ;;
+  checkpoint|cp) cmd_checkpoint "$@" ;;
+  dashboard|dash) cmd_dashboard ;;
+  _dashboard_render) _dashboard_render ;;
+  batch) cmd_batch "$@" ;;
+  template)
+    subcmd="${1:-help}"
+    shift || true
+    case "$subcmd" in
+      list|ls) cmd_template_list ;;
+      show) cmd_template_show "$@" ;;
+      create|new) cmd_template_create "$@" ;;
+      init) cmd_template_init ;;
+      *) error "Unknown template command: $subcmd"; echo "Usage: csession template [list|show|create|init]"; exit 1 ;;
+    esac
+    ;;
+  setup) cmd_setup ;;
+  help) usage ;;
+  *) error "Unknown command: $command"; usage; exit 1 ;;
+esac

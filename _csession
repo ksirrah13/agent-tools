@@ -1,0 +1,150 @@
+#compdef csession
+
+_csession_sessions() {
+  local sessions_dir="$HOME/.claude-sessions"
+  local -a sessions
+  if [[ -d "$sessions_dir" ]]; then
+    sessions=(${sessions_dir}/*(/:t))
+    sessions=(${sessions:#templates})
+  fi
+  _describe 'session' sessions
+}
+
+_csession_repos() {
+  local repos_root="$HOME/go/src/github.com/DataDog"
+  local -a repos
+  if [[ -d "$repos_root" ]]; then
+    repos=(${repos_root}/*(/:t))
+  fi
+  _describe 'repo' repos
+}
+
+_csession_templates() {
+  local tdir="$HOME/.claude-sessions/templates"
+  local -a templates
+  if [[ -d "$tdir" ]]; then
+    templates=(${tdir}/*.conf(:t:r))
+  fi
+  _describe 'template' templates
+}
+
+_csession() {
+  local -a commands
+  commands=(
+    'new:Create a new session'
+    'attach:Attach to an existing session'
+    'resume:Resume last Claude conversation'
+    'list:List all sessions'
+    'ls:List all sessions'
+    'status:Show session status'
+    'destroy:Destroy a session'
+    'rm:Destroy a session'
+    'window:Add a sub-thread window'
+    'win:Add a sub-thread window'
+    'run:Run Claude headless'
+    'logs:Tail session logs'
+    'info:Show session details'
+    'clone:Fork a session'
+    'open:Open session in editor'
+    'send:Send message to running session'
+    'watch:Stream session output'
+    'checkpoint:Save progress and restart'
+    'cp:Save progress and restart'
+    'dashboard:Live session overview'
+    'dash:Live session overview'
+    'batch:Launch sessions from manifest'
+    'template:Manage templates'
+    'help:Show help'
+  )
+
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+    return
+  fi
+
+  case "${words[2]}" in
+    new)
+      if (( CURRENT == 3 )); then
+        _message 'session-id'
+      else
+        _arguments \
+          '--repo[Repository name]:repo:_csession_repos' \
+          '--read-repos[Read-only repos]:repos:' \
+          '--template[Session template]:template:_csession_templates' \
+          '--branch[Branch name]:branch:' \
+          '--existing-branch[Use existing branch]' \
+          '--no-worktree[Skip worktree creation]' \
+          '--permission[Permission mode]:(default acceptEdits plan bypassPermissions)' \
+          '--allowed-tools[Allowed tools]:tools:' \
+          '--instructions[Additional instructions]:instructions:' \
+          '--instructions-file[Instructions file]:file:_files' \
+          '--prompt[Initial prompt]:prompt:'
+      fi
+      ;;
+    attach|resume|destroy|rm|logs|info|open|watch|checkpoint|cp)
+      if (( CURRENT == 3 )); then
+        _csession_sessions
+      elif [[ "${words[2]}" == "destroy" || "${words[2]}" == "rm" ]]; then
+        _arguments '--keep-state[Keep session state files]'
+      fi
+      ;;
+    send)
+      if (( CURRENT == 3 )); then
+        _csession_sessions
+      elif (( CURRENT == 4 )); then
+        _message 'message'
+      fi
+      ;;
+    clone)
+      if (( CURRENT == 3 )); then
+        _csession_sessions
+      elif (( CURRENT == 4 )); then
+        _message 'new-session-id'
+      fi
+      ;;
+    window|win)
+      if (( CURRENT == 3 )); then
+        _csession_sessions
+      elif (( CURRENT == 4 )); then
+        _message 'window-name'
+      else
+        _arguments \
+          '--permission[Permission mode]:(default acceptEdits plan bypassPermissions)' \
+          '--allowed-tools[Allowed tools]:tools:'
+      fi
+      ;;
+    run)
+      if (( CURRENT == 3 )); then
+        _csession_sessions
+      else
+        _arguments '--prompt[Prompt for headless run]:prompt:'
+      fi
+      ;;
+    batch)
+      if (( CURRENT == 3 )); then
+        _files -g '*.yaml' -g '*.yml'
+      fi
+      ;;
+    template)
+      if (( CURRENT == 3 )); then
+        local -a template_cmds
+        template_cmds=(
+          'list:List templates'
+          'ls:List templates'
+          'show:Show template contents'
+          'create:Create a new template'
+          'new:Create a new template'
+          'init:Create default templates'
+        )
+        _describe 'template command' template_cmds
+      elif (( CURRENT == 4 )); then
+        case "${words[3]}" in
+          show) _csession_templates ;;
+          create|new) _message 'template-name' ;;
+        esac
+      fi
+      ;;
+  esac
+}
+
+_csession "$@"
